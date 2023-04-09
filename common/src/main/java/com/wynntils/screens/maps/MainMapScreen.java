@@ -8,8 +8,8 @@ import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.wynntils.core.components.Managers;
 import com.wynntils.core.components.Models;
-import com.wynntils.models.lootruns.LootrunInstance;
 import com.wynntils.features.map.MapFeature;
+import com.wynntils.models.lootruns.LootrunInstance;
 import com.wynntils.models.map.PoiLocation;
 import com.wynntils.models.map.pois.CustomPoi;
 import com.wynntils.models.map.pois.IconPoi;
@@ -237,11 +237,20 @@ public final class MainMapScreen extends AbstractMapScreen {
                         .get());
 
         RenderUtils.disableScissor();
-        
+
         LootrunInstance currentLootrun = Models.Lootrun.getCurrentLootrun();
         if (currentLootrun != null) {
             MapRenderer.renderLootrunLine(
-                    currentLootrun, 5f, poseStack, centerX, centerZ, mapCenterX, mapCenterZ, currentZoom);
+                    currentLootrun,
+                    5f,
+                    poseStack,
+                    centerX,
+                    centerZ,
+                    mapCenterX,
+                    mapCenterZ,
+                    currentZoom,
+                    mapWidth,
+                    mapHeight);
         }
 
         renderBackground(poseStack);
