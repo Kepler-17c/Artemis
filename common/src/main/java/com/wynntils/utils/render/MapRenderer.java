@@ -27,6 +27,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Predicate;
 import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.world.phys.Vec3;
@@ -37,11 +38,10 @@ import org.lwjgl.opengl.GL13;
 public final class MapRenderer {
     public static Poi hovered = null;
 
-    // ####### Filtered Lootrun Points Cache Start #######
-    private static final Object cacheLock = new Object();
-    private static final ConcurrentMap<ColoredPath, TimedPathEntry> filteredPathMap = new ConcurrentHashMap<>();
+    // ####### Start of Filtered Lootrun Points Cache #######
+    private static final ConcurrentMap<ColoredPath, PathCacheEntry> filteredPathMap = new ConcurrentHashMap<>();
     private static final ExecutorService cacheRebuilderPool = Executors.newFixedThreadPool(1);
-    // #######  Filtered Lootrun Points Cache End  #######
+    // #######  End of Filtered Lootrun Points Cache  #######
 
     public static void renderMapQuad(
             MapTexture map,
@@ -358,25 +358,22 @@ public final class MapRenderer {
             float currentZoom,
             float mapWidth,
             float mapHeight) {
-        // test rebuild requirements
-        final long now = System.currentTimeMillis();
-        boolean needsRebuild;
-        synchronized (cacheLock) {
-            TimedPathEntry cacheEntry = filteredPathMap.get(path);
-            needsRebuild = now - 1000 > (cacheEntry != null ? cacheEntry.lastUse() : 0);
-            if (needsRebuild && cacheEntry != null) {
-                // set last use time to Long.MAX_VALUE as a kind of implicit lock
-                filteredPathMap.put(path, new TimedPathEntry(cacheEntry.points(), Long.MAX_VALUE));
-            }
-        }
+        PathCacheEntry cacheEntry = filteredPathMap.get(path);
+        float granularity = 1f / currentZoom * 10f;
+        // rebuild if not in cache
+        boolean needsRebuild = cacheEntry == null
+                // or when rebuild isn't blocked and ...
+                || (!cacheEntry.isRebuilding.getAndSet(true)
+                        // zoom changed enough or ...
+                        && (Math.abs(1f - cacheEntry.zoom / currentZoom) > .5f // .1f
+                                // map panning changed enough
+                                || Math.abs(cacheEntry.mapX - mapTextureX) > granularity
+                                || Math.abs(cacheEntry.mayZ - mapTextureZ) > granularity));
         if (needsRebuild) {
             cacheRebuilderPool.execute(
                     new RebuildTask(path, mapTextureX, mapTextureZ, currentZoom, mapWidth, mapHeight));
         }
-        synchronized (cacheLock) {
-            TimedPathEntry cacheEntry = filteredPathMap.get(path);
-            return cacheEntry != null ? cacheEntry.points() : Collections.emptyList();
-        }
+        return cacheEntry != null ? cacheEntry.points() : Collections.emptyList();
     }
 
     private record RebuildTask(
@@ -419,11 +416,12 @@ public final class MapRenderer {
                     sparsePoints.add(lastFilteredPoint);
                 }
             }
-            synchronized (cacheLock) {
-                filteredPathMap.put(path, new TimedPathEntry(sparsePoints, System.currentTimeMillis()));
-            }
+            filteredPathMap.put(
+                    path,
+                    new PathCacheEntry(sparsePoints, currentZoom, mapTextureX, mapTextureZ, new AtomicBoolean(false)));
         }
     }
 
-    private record TimedPathEntry(List<ColoredPosition> points, long lastUse) {}
+    private record PathCacheEntry(
+            List<ColoredPosition> points, float zoom, float mapX, float mayZ, AtomicBoolean isRebuilding) {}
 }
