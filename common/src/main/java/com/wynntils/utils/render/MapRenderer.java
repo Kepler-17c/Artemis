@@ -22,12 +22,9 @@ import com.wynntils.utils.mc.McUtils;
 import com.wynntils.utils.render.type.PointerType;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.Map;
 import java.util.function.Predicate;
 import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.world.phys.Vec3;
@@ -39,8 +36,8 @@ public final class MapRenderer {
     public static Poi hovered = null;
 
     // ####### Start of Filtered Lootrun Points Cache #######
-    private static final ConcurrentMap<ColoredPath, PathCacheEntry> filteredPathMap = new ConcurrentHashMap<>();
-    private static final ExecutorService cacheRebuilderPool = Executors.newFixedThreadPool(1);
+    private static LootrunInstance lastLootrun = null;
+    private static final Map<ColoredPath, PathCacheEntry> filteredPathMap = new HashMap<>();
     // #######  End of Filtered Lootrun Points Cache  #######
 
     public static void renderMapQuad(
@@ -223,13 +220,31 @@ public final class MapRenderer {
             float currentZoom,
             float mapWidth,
             float mapHeight) {
+        if (lastLootrun != lootrun) {
+            lastLootrun = lootrun;
+            filteredPathMap.clear();
+        }
+        // limit lod rebuilding by frame time
+        final long frameStartTime = System.currentTimeMillis();
+        // at 60 fps, each frame takes ~16ms
+        final long maxMsPerFrame = 8;
+        final long noRebuildAfter = frameStartTime + maxMsPerFrame;
         for (List<ColoredPath> value : lootrun.points().values()) {
             for (ColoredPath path : value) {
                 BufferBuilder bufferBuilder = Tesselator.getInstance().getBuilder();
                 bufferBuilder.begin(VertexFormat.Mode.TRIANGLE_STRIP, DefaultVertexFormat.POSITION_COLOR);
 
-                List<ColoredPosition> points =
-                        filterPathPoints(path, mapTextureX, mapTextureZ, currentZoom, mapWidth, mapHeight);
+                // default to cached lod
+                PathCacheEntry cacheEntry = filteredPathMap.get(path);
+                List<ColoredPosition> points = cacheEntry == null ? Collections.emptyList() : cacheEntry.points;
+                // check lod rebuilding
+                if (System.currentTimeMillis() < noRebuildAfter) {
+                    List<ColoredPosition> lod =
+                            getPathLodChecked(path, mapTextureX, mapTextureZ, currentZoom, mapWidth, mapHeight);
+                    if (lod != null) {
+                        points = lod;
+                    }
+                }
                 for (int i = 0; i < points.size() - 1; i++) {
                     ColoredPosition point1 = points.get(i);
                     Vec3 pos1 = point1.position();
@@ -351,7 +366,7 @@ public final class MapRenderer {
         }
     }
 
-    private static List<ColoredPosition> filterPathPoints(
+    private static List<ColoredPosition> getPathLodChecked(
             ColoredPath path,
             float mapTextureX,
             float mapTextureZ,
@@ -359,69 +374,63 @@ public final class MapRenderer {
             float mapWidth,
             float mapHeight) {
         PathCacheEntry cacheEntry = filteredPathMap.get(path);
-        float granularity = 1f / currentZoom * 10f;
-        // rebuild if not in cache
+        float granularity = 1f / currentZoom;
+        // rebuild if not in cache or ...
         boolean needsRebuild = cacheEntry == null
-                // or when rebuild isn't blocked and ...
-                || (!cacheEntry.isRebuilding.getAndSet(true)
-                        // zoom changed enough or ...
-                        && (Math.abs(1f - cacheEntry.zoom / currentZoom) > .5f // .1f
-                                // map panning changed enough
-                                || Math.abs(cacheEntry.mapX - mapTextureX) > granularity
-                                || Math.abs(cacheEntry.mayZ - mapTextureZ) > granularity));
+                // zoom changed enough or ...
+                || Math.abs(1f - cacheEntry.zoom / currentZoom) > .1f
+                // map panning changed enough
+                || Math.abs(cacheEntry.mapX - mapTextureX) > granularity
+                || Math.abs(cacheEntry.mayZ - mapTextureZ) > granularity;
         if (needsRebuild) {
-            cacheRebuilderPool.execute(
-                    new RebuildTask(path, mapTextureX, mapTextureZ, currentZoom, mapWidth, mapHeight));
+            List<ColoredPosition> lod = buildPathLod(path, currentZoom, mapWidth, mapHeight, mapTextureX, mapTextureZ);
+            filteredPathMap.put(path, new PathCacheEntry(lod, currentZoom, mapTextureX, mapTextureZ));
+            return lod;
+        } else {
+            return null;
         }
-        return cacheEntry != null ? cacheEntry.points() : Collections.emptyList();
     }
 
-    private record RebuildTask(
-            ColoredPath path, float mapTextureX, float mapTextureZ, float currentZoom, float mapWidth, float mapHeight)
-            implements Runnable {
-
-        @Override
-        public void run() {
-            // first filter by visible/drawn area
-            float granularity = 1f / currentZoom;
-            float renderedWorldWidth = mapWidth * granularity;
-            float renderedWorldHeight = mapHeight * granularity;
-            float drawnAreaStartX = mapTextureX - renderedWorldWidth / 2;
-            float drawnAreaStartZ = mapTextureZ - renderedWorldHeight / 2;
-            float drawnAreaEndX = mapTextureX + renderedWorldWidth / 2;
-            float drawnAreaEndZ = mapTextureZ + renderedWorldHeight / 2;
-            Predicate<ColoredPosition> areaFilter = point -> {
-                Vec3 pos = point.position();
-                return pos.x > drawnAreaStartX
-                        && pos.x < drawnAreaEndX
-                        && pos.z > drawnAreaStartZ
-                        && pos.z < drawnAreaEndZ;
-            };
-            List<ColoredPosition> areaFilteredPoints =
-                    path.points().stream().filter(areaFilter).toList();
-            // then filter unnoticeable intermediate path
-            List<ColoredPosition> sparsePoints = new ArrayList<>();
-            if (!areaFilteredPoints.isEmpty()) {
-                sparsePoints.add(areaFilteredPoints.get(0));
-                Vec3 lastPos = sparsePoints.get(0).position();
-                for (ColoredPosition colPos : areaFilteredPoints) {
-                    if (!lastPos.closerThan(colPos.position(), granularity)) {
-                        lastPos = colPos.position();
-                        sparsePoints.add(colPos);
-                    }
-                }
-                ColoredPosition lastSparsePoint = sparsePoints.get(sparsePoints.size() - 1);
-                ColoredPosition lastFilteredPoint = areaFilteredPoints.get(areaFilteredPoints.size() - 1);
-                if (areaFilteredPoints.size() > 1 && lastSparsePoint != lastFilteredPoint) {
-                    sparsePoints.add(lastFilteredPoint);
+    private static List<ColoredPosition> buildPathLod(
+            ColoredPath path,
+            float currentZoom,
+            float mapWidth,
+            float mapHeight,
+            float mapTextureX,
+            float mapTextureZ) {
+        // first filter by visible/drawn area
+        float granularity = 1f / currentZoom;
+        float renderedWorldWidth = mapWidth * granularity;
+        float renderedWorldHeight = mapHeight * granularity;
+        float drawnAreaStartX = mapTextureX - renderedWorldWidth / 2;
+        float drawnAreaStartZ = mapTextureZ - renderedWorldHeight / 2;
+        float drawnAreaEndX = mapTextureX + renderedWorldWidth / 2;
+        float drawnAreaEndZ = mapTextureZ + renderedWorldHeight / 2;
+        Predicate<ColoredPosition> areaFilter = point -> {
+            Vec3 pos = point.position();
+            return pos.x > drawnAreaStartX && pos.x < drawnAreaEndX && pos.z > drawnAreaStartZ && pos.z < drawnAreaEndZ;
+        };
+        List<ColoredPosition> areaFilteredPoints =
+                path.points().stream().filter(areaFilter).toList();
+        // then filter unnoticeable intermediate path
+        List<ColoredPosition> sparsePoints = new ArrayList<>();
+        if (!areaFilteredPoints.isEmpty()) {
+            sparsePoints.add(areaFilteredPoints.get(0));
+            Vec3 lastPos = sparsePoints.get(0).position();
+            for (ColoredPosition colPos : areaFilteredPoints) {
+                if (!lastPos.closerThan(colPos.position(), granularity)) {
+                    lastPos = colPos.position();
+                    sparsePoints.add(colPos);
                 }
             }
-            filteredPathMap.put(
-                    path,
-                    new PathCacheEntry(sparsePoints, currentZoom, mapTextureX, mapTextureZ, new AtomicBoolean(false)));
+            ColoredPosition lastSparsePoint = sparsePoints.get(sparsePoints.size() - 1);
+            ColoredPosition lastFilteredPoint = areaFilteredPoints.get(areaFilteredPoints.size() - 1);
+            if (areaFilteredPoints.size() > 1 && lastSparsePoint != lastFilteredPoint) {
+                sparsePoints.add(lastFilteredPoint);
+            }
         }
+        return sparsePoints;
     }
 
-    private record PathCacheEntry(
-            List<ColoredPosition> points, float zoom, float mapX, float mayZ, AtomicBoolean isRebuilding) {}
+    private record PathCacheEntry(List<ColoredPosition> points, float zoom, float mapX, float mayZ) {}
 }
